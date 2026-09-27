@@ -60,6 +60,18 @@
         <option value="A2">A2</option>
         <option value="B1">B1</option>
       </select>
+      <select id="category">
+        <option value="ALL">All words</option>
+        <option value="nouns">Nouns (der + die + das)</option>
+        <option value="der">der – masculine</option>
+        <option value="die">die – feminine</option>
+        <option value="das">das – neuter</option>
+        <option value="verbs">Verbs</option>
+        <option value="separable_verbs">Separable verbs</option>
+        <option value="adjectives">Adjectives</option>
+        <option value="function_words">Function words</option>
+        <option value="phrases">Phrases</option>
+      </select>
       <button class="secondary" id="shuffle">🔀 Shuffle</button>
     </div>
 
@@ -69,6 +81,7 @@
 
     <div class="controls">
       <button id="listen">🔊 Listen</button>
+      <button id="pronounce">🗣 Pronounce word</button>
       <button class="secondary" id="repeat">🔁 Repeat</button>
       <button class="secondary" id="prev">← Previous</button>
       <button class="secondary" id="next">Next →</button>
@@ -87,6 +100,8 @@
     <div class="hint">
       Tip: For listening practice, first listen without looking at the English meaning.
       Then say the German sentence yourself before moving to the next word.
+      <br>🗣 Pronounce word (or press <b>W</b>) says the German word, then its English meaning,
+      then the German word again slowly. Auto-play does this for every word, followed by the example sentence.
     </div>
   </div>
 </div>
@@ -117,11 +132,11 @@ async function loadVocabulary() {
     // and other categories containing arrays of vocabulary objects.
     allWords = [];
     for (const [level, levelData] of Object.entries(data.levels || {})) {
-      walk(levelData, level);
+      walk(levelData, level, "");
     }
 
-    words = allWords;
-    if (!words.length) throw new Error("No vocabulary entries found.");
+    if (!allWords.length) throw new Error("No vocabulary entries found.");
+    words = [...allWords];
     update();
   } catch (err) {
     $("word").textContent = "Could not load vocabulary";
@@ -131,12 +146,15 @@ async function loadVocabulary() {
   }
 }
 
-function walk(value, level) {
+// category is the key holding the array: der/die/das for nouns,
+// otherwise verbs, adjectives, phrases, etc.
+function walk(value, level, category) {
   if (Array.isArray(value)) {
     for (const item of value) {
       if (item && typeof item === "object" && (item.de || item.word)) {
         allWords.push({
           level,
+          category,
           de: item.de || item.word,
           en: item.en || "",
           example: item.example || item.de || item.word || ""
@@ -146,46 +164,126 @@ function walk(value, level) {
     return;
   }
   if (value && typeof value === "object") {
-    for (const child of Object.values(value)) walk(child, level);
+    for (const [key, child] of Object.entries(value)) walk(child, level, key);
   }
 }
 
+const CATEGORY_LABELS = {
+  der: "der-Nomen", die: "die-Nomen", das: "das-Nomen",
+  verbs: "Verb", separable_verbs: "Trennbares Verb", adjectives: "Adjektiv",
+  function_words: "Funktionswort", phrases: "Redemittel"
+};
+
 function update() {
   const item = words[index];
+  if (!item) {
+    stopSpeaking();
+    $("word").textContent = "No words here";
+    $("meaning").textContent = "";
+    $("example").textContent = "Try a different level or category.";
+    $("progress").textContent = "0 / 0";
+    $("status").textContent = "";
+    return;
+  }
   $("word").textContent = item.de;
   $("meaning").textContent = item.en ? `English: ${item.en}` : "";
   $("example").textContent = item.example;
-  $("progress").textContent = `${index + 1} / ${words.length} · ${item.level}`;
+  $("progress").textContent =
+    `${index + 1} / ${words.length} · ${item.level} · ${CATEGORY_LABELS[item.category] || item.category}`;
   $("status").textContent = "";
 }
 
-function speak(text) {
-  speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = "de-DE";
-  utterance.rate = parseFloat($("speed").value);
-  utterance.pitch = 1;
+// Each new sequence gets a token; callbacks from a cancelled sequence
+// see a stale token and do nothing (prevents double-advancing in auto-play).
+let speakToken = 0;
 
-  // Prefer a German voice.
-  const germanVoice = voices.find(v => /^de(-|_)/i.test(v.lang));
-  if (germanVoice) utterance.voice = germanVoice;
-
-  utterance.onstart = () => $("status").textContent = "🔊 Listening…";
-  utterance.onend = () => {
-    $("status").textContent = "Finished.";
-    if (autoPlay) setTimeout(nextWord, 900);
-  };
-  utterance.onerror = () => $("status").textContent = "Speech could not be played.";
-  speechSynthesis.speak(utterance);
+function voiceFor(lang) {
+  const prefix = lang.slice(0, 2);
+  return voices.find(v => v.lang.replace("_", "-").toLowerCase() === lang.toLowerCase())
+      || voices.find(v => new RegExp(`^${prefix}(-|_|$)`, "i").test(v.lang));
 }
 
-function listen() { speak(words[index].example); }
+// parts: [{ text, lang, rate, label, pause }]
+function speakSequence(parts, onDone) {
+  speechSynthesis.cancel();
+  const token = ++speakToken;
+  let i = 0;
+
+  const speakNext = () => {
+    if (token !== speakToken) return;
+    if (i >= parts.length) {
+      $("status").textContent = "Finished.";
+      if (onDone) onDone();
+      return;
+    }
+    const part = parts[i++];
+    const utterance = new SpeechSynthesisUtterance(part.text);
+    utterance.lang = part.lang;
+    utterance.rate = part.rate;
+    utterance.pitch = 1;
+    const voice = voiceFor(part.lang);
+    if (voice) utterance.voice = voice;
+
+    utterance.onstart = () => {
+      if (token === speakToken) $("status").textContent = part.label;
+    };
+    utterance.onend = () => setTimeout(speakNext, part.pause ?? 350);
+    utterance.onerror = e => {
+      if (token !== speakToken || e.error === "interrupted" || e.error === "canceled") return;
+      $("status").textContent = "Speech could not be played.";
+    };
+    speechSynthesis.speak(utterance);
+  };
+  speakNext();
+}
+
+function speed() { return parseFloat($("speed").value); }
+
+function speak(text) {
+  speakSequence(
+    [{ text, lang: "de-DE", rate: speed(), label: "🔊 Listening…" }],
+    () => { if (autoPlay) setTimeout(nextWord, 900); }
+  );
+}
+
+// German word → English meaning → German word slowly.
+function pronounceParts(item) {
+  const parts = [{ text: item.de, lang: "de-DE", rate: speed(), label: "🇩🇪 German word…", pause: 500 }];
+  if (item.en) parts.push({ text: item.en, lang: "en-US", rate: 1, label: "🇬🇧 Meaning…", pause: 600 });
+  parts.push({ text: item.de, lang: "de-DE", rate: Math.max(0.4, speed() * 0.6), label: "🐢 German word, slowly…", pause: 700 });
+  return parts;
+}
+
+function pronounce() {
+  const item = words[index];
+  if (item) speakSequence(pronounceParts(item));
+}
+
+// Auto-play: pronounce the word, then read the example sentence, then advance.
+function autoStep() {
+  const item = words[index];
+  if (!item) return;
+  const parts = pronounceParts(item);
+  if (item.example && item.example !== item.de) {
+    parts.push({ text: item.example, lang: "de-DE", rate: speed(), label: "🔊 Example sentence…" });
+  }
+  speakSequence(parts, () => { if (autoPlay) setTimeout(nextWord, 900); });
+}
+
+function stopSpeaking() {
+  speakToken++; // invalidate any queued parts
+  speechSynthesis.cancel();
+}
+
+function listen() { if (words[index]) speak(words[index].example); }
 function nextWord() {
+  if (!words.length) return;
   index = (index + 1) % words.length;
   update();
-  if (autoPlay) setTimeout(listen, 250);
+  if (autoPlay) setTimeout(autoStep, 250);
 }
 function prevWord() {
+  if (!words.length) return;
   index = (index - 1 + words.length) % words.length;
   update();
 }
@@ -197,31 +295,43 @@ function shuffle() {
   index = 0;
   update();
 }
-function filterLevel() {
+const NOUN_ARTICLES = ["der", "die", "das"];
+
+function applyFilters() {
   const level = $("level").value;
-  words = level === "ALL" ? [...allWords] : allWords.filter(x => x.level === level);
+  const category = $("category").value;
+  words = allWords.filter(x =>
+    (level === "ALL" || x.level === level) &&
+    (category === "ALL" ||
+     x.category === category ||
+     (category === "nouns" && NOUN_ARTICLES.includes(x.category)))
+  );
   index = 0;
   update();
+  if (autoPlay && words.length) setTimeout(autoStep, 250);
 }
 
 $("listen").onclick = listen;
 $("repeat").onclick = listen;
+$("pronounce").onclick = pronounce;
 $("next").onclick = nextWord;
 $("prev").onclick = prevWord;
 $("shuffle").onclick = shuffle;
-$("level").onchange = filterLevel;
+$("level").onchange = applyFilters;
+$("category").onchange = applyFilters;
 $("speed").oninput = () => $("speedValue").textContent = $("speed").value + "×";
 $("auto").onclick = () => {
   autoPlay = !autoPlay;
   $("auto").textContent = autoPlay ? "⏸ Auto-play: On" : "▶ Auto-play: Off";
-  if (autoPlay) listen();
-  else speechSynthesis.cancel();
+  if (autoPlay) autoStep();
+  else { stopSpeaking(); $("status").textContent = ""; }
 };
 
 document.addEventListener("keydown", e => {
   if (e.code === "Space") { e.preventDefault(); listen(); }
   if (e.code === "ArrowRight") nextWord();
   if (e.code === "ArrowLeft") prevWord();
+  if (e.code === "KeyW") pronounce();
 });
 
 loadVocabulary();
